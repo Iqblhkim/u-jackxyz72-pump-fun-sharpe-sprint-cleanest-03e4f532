@@ -1,52 +1,38 @@
-// Steady Scalper: a Sharpe-first paper bot for the pump.fun bonding-curve replay
-// (agent-fun/replay/v2).
+// Steady Scalper — paper bot for the Pump.fun Sharpe Sprint replay
+// (agent-fun/replay/v2). Ranking is by HOURLY Sharpe over a 6h forward
+// replay, so the design optimises many small diversified launch trades
+// instead of one big bet.
 //
-// What the dev window (24h, 2-3 Nov 2026, 1222 coins) actually says, measured
-// with tools/analyse.ts + tools/analyse2.ts on every coin's price path:
+// What the 24h dev window (2-3 Nov 2026, 1222 coins) measured:
 //
-//   - The ONLY entries with a positive mean return are breadth-filtered launch
-//     buys held ~20 slots with NO tight take-profit / stop-loss: mean +2.9%,
-//     sd 27.6% per trade (median -2.7%: the mean lives in the right tail, a few
-//     coins run 10-100x). Every tight TP/SL variant tested (TP 6-15%, SL 4-10%,
-//     hold 8-20) has a NEGATIVE mean (-2.7% to -4.4%): the ~2.5% round-trip
-//     curve fees plus tx fees eat the small wins, and capping the upside kills
-//     the tail that pays for the losers. So this bot does NOT take quick small
-//     profits — it banks a PARTIAL profit on big runs and lets the rest ride.
-//   - Breadth is the filter that matters: coins whose opening tape shows >= 6
-//     distinct non-creator buyers, net SOL in >= 0.3, buys >= 60% of trades,
-//     price +15-30% over the first trade, real SOL >= 3, creator bought 0 and
-//     never sold. Loosening it (5 buyers, wider runup) adds coins but worsens
-//     mean/sd; the strict filter stays.
-//   - Fixed tx fees (0.000105 SOL/order) are a real drag at small stakes: a
-//     0.03 SOL buy pays 0.7% round-trip in tx fees alone. Effective stake is
-//     capped at 1% of real SOL, so entries wait for real SOL >= 3.
+//   * The only entries with a positive mean return are breadth-filtered
+//     launch buys held ~20 slots with NO tight take-profit / stop-loss
+//     (mean +2.9%, sd 27.6% per trade; the mean lives in the right tail).
+//     Every tight TP/SL variant tested (TP 6-15%, SL 4-10%, hold 8-20)
+//     has a NEGATIVE mean (-2.7% to -4.4%): the ~2.5% round-trip curve
+//     fee eats small wins and capping the upside kills the tail that
+//     pays. So: no tight exits; hold the full 20 slots, exit early only
+//     when the creator sells.
+//   * Breadth is the filter that matters: >= 7 distinct non-creator
+//     buyers, net SOL >= 0.3, buys >= 60% of trades, price +15-30% over
+//     the first trade, real SOL >= 3, creator bought 0 SOL and never
+//     sold, no single buyer above 60% of buy SOL.
+//   * Pyramiding into strength (adds while up >= 30%) raises net PnL
+//     and the median 6h Sharpe on the dev window, so it ships ON.
+//   * Guardrail pacer: tiny 0.01 SOL probe round trips keep the filled
+//     coin count on pace for the 20-coin minimum over the 6h final
+//     window (paceSecs 21600, target 25 coins).
 //
-// Sharpe design (ranking is by HOURLY Sharpe, not net PnL):
-//   - Many small, diversified launch trades (max 5 open) so each hour's return
-//     is an average of several independent bets, not one coin's lottery ticket.
-//   - Tight take-profits and stop-losses were TESTED and REJECTED: every tight
-//     TP/SL variant has a negative mean (the ~2.5% round-trip curve fees eat
-//     small wins, and capping the upside kills the tail that pays for the
-//     strategy). The partial-TP and trailing-stop knobs exist for research but
-//     ship OFF: the data says the edge lives in letting filtered runners run
-//     the full 20-slot hold.
-//   - Pyramiding into strength (adds while up >= 30%) raises both net PnL and
-//     the median 6h Sharpe on the dev window, so it ships ON (max 3 adds of
-//     0.2 SOL): it sizes into the coins that are actually running.
-//   - Time exit at maxHold slots; immediate exit if the creator sells.
-//   - Guardrail pacer: tiny 0.01 SOL probe round trips keep the filled-coin
-//     count on pace for the 20-coin minimum (the final window is only 6h, so
-//     the pace is set to 6h, not 24h).
-//
-// Pure function of the batches the harness sends: no clock, no randomness, no
-// I/O, no environment reads. Iteration is over insertion-ordered maps fed by
-// the batch stream, with explicit sorts wherever order could otherwise depend
-// on map iteration, so the two graded executions produce byte-identical logs.
+// Pure function of the batches the harness sends: no clock, no random
+// source, no I/O, no environment reads. Iteration is over
+// insertion-ordered maps fed by the batch stream, with explicit sorts
+// wherever order could otherwise depend on map iteration, so the two
+// graded executions reproduce byte for byte.
 
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
 
 export interface Params {
-  /** Most slots after the CreateEvent during which a first buy may be decided. */
+  /** Max slots after CreateEvent in which a first buy may be decided. */
   maxAge: number;
   /** Trades seen before an entry is allowed. */
   minTrades: number;
@@ -56,9 +42,9 @@ export interface Params {
   minNetSol: number;
   /** Buys must be at least this share of all trades seen. */
   minBuyShare: number;
-  /** Price now must be at least this far above the first trade's price. */
+  /** Price must be at least this far above the first trade's price. */
   minRunup: number;
-  /** ...and at most this far above it (do not chase a launch that already ran). */
+  /** ...and at most this far above it (don't chase a launch that ran). */
   maxRunup: number;
   /** Real SOL reserve window at decision time. */
   minRealSol: number;
@@ -69,43 +55,43 @@ export interface Params {
   maxDevBuySol: number;
   /** Skip the coin entirely once the creator has sold any amount. */
   skipDevSold: boolean;
-  /** SOL to put into one position (capped by 1% of real reserve and free cash). */
+  /** SOL per position (capped by 1% of real reserve and free cash). */
   stakeSol: number;
-  /** Smallest buy worth sending (tx fee is ~0.000105 SOL per order). */
+  /** Smallest buy worth sending (tx fee ~0.000105 SOL per order). */
   minBuySol: number;
   /** Slippage allowed on buys (bps); sells always go out at 10000. */
   buySlipBps: number;
-  /** Exit when the position's liquidation value falls this far under its cost (1 = off). */
+  /** Exit when liquidation value falls this far under cost (1 = off). */
   stopLoss: number;
-  /** Sell this fraction of the position once it is up takeProfit (0 = off). */
+  /** Sell this fraction once up takeProfit (0 = off). */
   partialPart: number;
   /** ...at this gain over cost. */
   takeProfit: number;
-  /** The trailing stop arms once value reaches cost * (1 + trailArm) (1e9 = off). */
+  /** Trailing stop arms once value reaches cost * (1 + trailArm) (1e9 = off). */
   trailArm: number;
   /** Once armed, exit on a fall of this share from the best value. */
   trail: number;
-  /** Exit after holding this many slots (unless the trailing stop is armed and rising). */
+  /** Exit after holding this many slots (unless trailing stop armed & rising). */
   maxHold: number;
   /** Slots to wait after an exit before the same coin may be bought again. */
   cooldown: number;
   /** Most first entries per coin over the run. */
   maxEntries: number;
-  /** Pyramiding into strength (0 = off). See Launch Surfer notes: adds raise net
-   * PnL but concentrate size into single coins, i.e. more variance per hour. */
+  /** Pyramiding into strength (0 = off). */
   maxAdds: number;
   addDelay: number;
   addSol: number;
   addIfUp: number;
   addStep: number;
   addMinBuyers: number;
-  /** Most SOL at cost across all positions at once (a drawdown guard). */
+  /** Most SOL at cost across all positions at once (drawdown guard). */
   maxExposureSol: number;
-  /** Guardrail pacing: the run must end with a round trip of >= 0.01 SOL on
-   * >= 20 coins. When the bot's own filled coins lag targetCoins scaled by the
-   * share of paceSecs of block time elapsed, it opens tiny probe round trips
-   * (buy probeSol, sell it all as soon as the buy lands) on the most liquid
-   * traded coins until it is back on pace. paceSecs is the FINAL window (6h). */
+  /** Guardrail pacing: the run must end with a round trip of >= 0.01 SOL
+   * on >= 20 coins. When the bot's own filled coins lag targetCoins
+   * scaled by the share of paceSecs of block time elapsed, it opens tiny
+   * probe round trips (buy probeSol, sell it all as soon as the buy
+   * lands) on the most liquid traded coins until back on pace.
+   * paceSecs is the FINAL window (6h). */
   targetCoins: number;
   paceSecs: number;
   probeSol: number;
@@ -177,7 +163,7 @@ interface Held {
   filled: boolean;
   armed: boolean;
   partialTaken: boolean;
-  /** Adds sent so far, and the price/slot/buyer count of the last buy. */
+  /** Adds sent so far, plus price/slot/buyer count of the last buy. */
   adds: number;
   lastBuyPrice: number;
   lastBuySlot: number;
@@ -310,7 +296,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         if (value > h.peakValue) h.peakValue = value;
         if (value >= cost * (1 + p.trailArm)) h.armed = true;
         const t = tapeOf(mint);
-        // Partial take-profit: bank half once up takeProfit, once per position.
+        // Partial take-profit: bank a slice once up takeProfit, once per position.
         if (
           p.partialPart > 0 &&
           !h.partialTaken &&
